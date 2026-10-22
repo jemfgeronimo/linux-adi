@@ -168,6 +168,17 @@ config AD4695
 	  To compile this driver as a module, choose M here: the module will be
 	  called ad4695.
 
+config AD5940
+	tristate "Analog Devices AD5940/AD5941 AFE driver"
+	depends on SPI
+	select REGMAP
+	help
+	  Say yes here to build support for Analog Devices AD5940 and AD5941
+	  high precision, impedance and electrochemical analog front ends.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called ad5940.
+
 config AD7091R
 	tristate
 

@@ -1262,6 +1262,14 @@ S:	Supported
 F:	Documentation/devicetree/bindings/iio/dac/adi,ad5770r.yaml
 F:	drivers/iio/dac/ad5770r.c
 
+ANALOG DEVICES INC AD5940 DRIVER
+M:	John Erasmus Mari Geronimo <johnerasmusmari.geronimo@analog.com>
+L:	linux-iio@vger.kernel.org
+S:	Supported
+W:	https://ez.analog.com/linux-software-drivers
+F:	Documentation/devicetree/bindings/iio/adc/adi,ad5940.yaml
+F:	drivers/iio/adc/ad5940.c
+
 AMT (Automatic Multicast Tunneling)
 M:	Taehee Yoo <ap420073@gmail.com>
 L:	netdev@vger.kernel.org
