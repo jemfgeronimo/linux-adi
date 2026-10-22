@@ -129,8 +129,8 @@
 #define AD5940_REG32_MAX		0x3014
 #define AD5940_MAX_REGISTER		0xffff
 
-#define AD5940_RESET_PULSE_US		1000
-#define AD5940_RESET_WAIT_MS		10
+#define AD5940_RESET_PULSE_US		10
+#define AD5940_RESET_WAIT_MS		30
 
 struct ad5940_channel_config {
 	u32 ain;
@@ -537,6 +537,7 @@ static int ad5940_config_int_io(struct ad5940_state *st, u8 int_io)
 	return regmap_write(st->regmap, AD5940_REG_GP0OEN, BIT(int_io));
 }
 
+/* Initialization sequence required after each reset, see Table 14. */
 static const u32 ad5940_powerup_setting[][2] = {
 	{ 0x0908, 0x02c9 },
 	{ 0x0c08, 0x206c },
@@ -548,10 +549,6 @@ static const u32 ad5940_powerup_setting[][2] = {
 	{ 0x0a04, 0xf27b },
 	{ 0x0a00, 0x8009 },
 	{ 0x22f0, 0x0000 },
-	{ 0x2230, 0xde87a5af },
-	{ 0x2250, 0x103f },
-	{ 0x22b0, 0x203c },
-	{ 0x2230, 0xde87a5a0 },
 };
 
 static void ad5940_hw_reset(struct ad5940_state *st)
