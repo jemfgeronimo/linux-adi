@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * AD5940 SPI ADC driver
+ * AD5940/AD5941 SPI ADC driver
  *
  * Copyright (C) 2019 Song Qiang <songqiang1304521@gmail.com>
  */
@@ -121,8 +121,10 @@
 #define AD5940_AFECON_CHIPID		0x00000404
 #define AD5940_CHIPID_PARTID_MSK	GENMASK(15, 4)
 #define AD5940_PARTID			0x550
-#define AD5940_DEFAULT_VREF_MV		1820
+#define AD5940_VREF_MV			1820
 #define AD5940_ADC_MIDSCALE		32768
+#define AD5940_AIN6_MUXP		22
+#define AD5940_AIN6_MUXN		14
 
 /* Registers in this range are 32 bits wide, all others are 16 bits wide. */
 #define AD5940_REG32_MIN		0x1000
@@ -135,6 +137,12 @@
 struct ad5940_channel_config {
 	u32 ain;
 	const char *channel_name;
+};
+
+struct ad5940_chip_info {
+	const char *name;
+	unsigned int num_gpios;
+	bool has_ain6;
 };
 
 struct ad5940_state {
@@ -150,10 +158,21 @@ struct ad5940_state {
 	u8 n_input;
 	u8 p_input;
 
-	int vref_mv;
-
+	const struct ad5940_chip_info *info;
 	int num_channels;
 	struct ad5940_channel_config *channel_config;
+};
+
+static const struct ad5940_chip_info ad5940_chip_info = {
+	.name = "ad5940",
+	.num_gpios = 8,
+	.has_ain6 = true,
+};
+
+static const struct ad5940_chip_info ad5941_chip_info = {
+	.name = "ad5941",
+	.num_gpios = 3,
+	.has_ain6 = false,
 };
 
 /*
@@ -390,7 +409,7 @@ static int ad5940_read_raw(struct iio_dev *indio_dev,
 		*val = -AD5940_ADC_MIDSCALE;
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
-		*val = st->vref_mv;
+		*val = AD5940_VREF_MV;
 		*val2 = 15;
 		return IIO_VAL_FRACTIONAL_LOG2;
 	default:
@@ -425,15 +444,18 @@ static bool ad5940_in_list(const u8 *list, size_t len, u32 val)
 	return false;
 }
 
-static int ad5940_check_channel_indexes(struct device *dev, u32 *ain)
+static int ad5940_check_channel_indexes(struct ad5940_state *st,
+					struct device *dev, u32 *ain)
 {
 	if (!ad5940_in_list(ad5940_channel_p, ARRAY_SIZE(ad5940_channel_p),
-			    ain[0]))
+			    ain[0]) ||
+	    (!st->info->has_ain6 && ain[0] == AD5940_AIN6_MUXP))
 		return dev_err_probe(dev, -EINVAL,
 				     "Invalid positive input %u\n", ain[0]);
 
 	if (!ad5940_in_list(ad5940_channel_n, ARRAY_SIZE(ad5940_channel_n),
-			    ain[1]))
+			    ain[1]) ||
+	    (!st->info->has_ain6 && ain[1] == AD5940_AIN6_MUXN))
 		return dev_err_probe(dev, -EINVAL,
 				     "Invalid negative input %u\n", ain[1]);
 
@@ -487,7 +509,7 @@ static int ad5940_parse_channel_config(struct iio_dev *indio_dev)
 		if (ret)
 			st->channel_config[channel].channel_name = "none-name";
 
-		ret = ad5940_check_channel_indexes(dev, ain);
+		ret = ad5940_check_channel_indexes(st, dev, ain);
 		if (ret)
 			return ret;
 
@@ -630,7 +652,6 @@ static int ad5940_probe(struct spi_device *spi)
 	struct ad5940_bus *bus;
 	u32 trig_type;
 	u32 int_io;
-	int vref_uv;
 	int ret;
 
 	indio_dev = devm_iio_device_alloc(dev, sizeof(*st));
@@ -638,13 +659,17 @@ static int ad5940_probe(struct spi_device *spi)
 		return -ENOMEM;
 
 	st = iio_priv(indio_dev);
+	st->info = spi_get_device_match_data(spi);
+	if (!st->info)
+		return -ENODEV;
 
 	ret = device_property_read_u32(dev, "adi,interrupt-io", &int_io);
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "Failed to read adi,interrupt-io\n");
 
-	if (!ad5940_in_list(ad5940_int_io, ARRAY_SIZE(ad5940_int_io), int_io))
+	if (!ad5940_in_list(ad5940_int_io, ARRAY_SIZE(ad5940_int_io), int_io) ||
+	    int_io >= st->info->num_gpios)
 		return dev_err_probe(dev, -EINVAL,
 				     "Invalid interrupt output pin %u\n",
 				     int_io);
@@ -676,15 +701,20 @@ static int ad5940_probe(struct spi_device *spi)
 		return dev_err_probe(dev, -EINVAL,
 				     "Trigger type must be rising or falling\n");
 
-	vref_uv = devm_regulator_get_enable_read_voltage(dev, "vref");
-	if (vref_uv >= 0)
-		st->vref_mv = vref_uv / 1000;
-	else if (vref_uv == -ENODEV)
-		st->vref_mv = AD5940_DEFAULT_VREF_MV;
-	else
-		return dev_err_probe(dev, vref_uv, "Failed to get vref\n");
+	ret = devm_regulator_get_enable(dev, "avdd");
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to enable AVDD\n");
 
-	indio_dev->name = "ad5940";
+	/* DVDD must be driven before IOVDD is enabled. */
+	ret = devm_regulator_get_enable(dev, "dvdd");
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to enable DVDD\n");
+
+	ret = devm_regulator_get_enable(dev, "iovdd");
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to enable IOVDD\n");
+
+	indio_dev->name = st->info->name;
 	indio_dev->modes = INDIO_DIRECT_MODE;
 	indio_dev->info = &ad5940_info;
 
@@ -707,13 +737,15 @@ static int ad5940_probe(struct spi_device *spi)
 }
 
 static const struct of_device_id ad5940_of_match[] = {
-	{ .compatible = "adi,ad5940" },
+	{ .compatible = "adi,ad5940", .data = &ad5940_chip_info },
+	{ .compatible = "adi,ad5941", .data = &ad5941_chip_info },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ad5940_of_match);
 
 static const struct spi_device_id ad5940_id[] = {
-	{ "ad5940" },
+	{ "ad5940", (kernel_ulong_t)&ad5940_chip_info },
+	{ "ad5941", (kernel_ulong_t)&ad5941_chip_info },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, ad5940_id);
@@ -729,5 +761,5 @@ static struct spi_driver ad5940_driver = {
 module_spi_driver(ad5940_driver);
 
 MODULE_AUTHOR("Song Qiang <songqiang1304521@gmail.com>");
-MODULE_DESCRIPTION("Analog Devices AD5940 ADC driver");
+MODULE_DESCRIPTION("Analog Devices AD5940/AD5941 ADC driver");
 MODULE_LICENSE("GPL");
