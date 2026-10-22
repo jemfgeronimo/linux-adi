@@ -38,6 +38,10 @@ properties:
   interrupts:
     maxItems: 1
 
+  reset-gpios:
+    maxItems: 1
+    description: Active low RESET pin.
+
   adi,interrupt-io:
     $ref: /schemas/types.yaml#/definitions/uint32
     description:
