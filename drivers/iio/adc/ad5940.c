@@ -433,7 +433,7 @@ static int ad5940_parse_channel_config(struct iio_dev *indio_dev)
 			return dev_err_probe(dev, ret,
 					     "Missing diff-channels property\n");
 
-		ret = fwnode_property_read_string(child, "channel-name",
+		ret = fwnode_property_read_string(child, "label",
 						  &st->channel_config[channel].channel_name);
 		if (ret)
 			st->channel_config[channel].channel_name = "none-name";
