@@ -1,19 +1,29 @@
-// SPDX-License-Identifier: GPL
+// SPDX-License-Identifier: GPL-2.0
 /*
  * AD5940 SPI ADC driver
  *
  * Copyright (C) 2019 Song Qiang <songqiang1304521@gmail.com>
  */
 
+#include <linux/array_size.h>
 #include <linux/bitfield.h>
-#include <linux/bsearch.h>
-#include <linux/delay.h>
+#include <linux/bits.h>
+#include <linux/cleanup.h>
+#include <linux/completion.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/jiffies.h>
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
-#include <linux/of_irq.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
+#include <linux/string.h>
+#include <linux/types.h>
 
 #include <linux/iio/iio.h>
 
@@ -106,6 +116,8 @@
 
 #define AD5940_AFECON_CHIPID		0x00000404
 #define AD5940_CHIPID			0x5502
+#define AD5940_DEFAULT_VREF_MV		1820
+#define AD5940_ADC_MIDSCALE		32768
 
 struct ad5940_channel_config {
 	u32 ain;
@@ -123,7 +135,6 @@ struct ad5940_state {
 	u8 n_input;
 	u8 p_input;
 
-	struct regulator *vref;
 	int vref_mv;
 
 	int num_channels;
@@ -131,7 +142,7 @@ struct ad5940_state {
 	union {
 		__be32 d32;
 		u8 d8[5];
-	} data ____cacheline_aligned;
+	} data __aligned(IIO_DMA_MINALIGN);
 };
 
 static int ad5940_set_addr(struct ad5940_state *st, u16 addr)
@@ -229,23 +240,24 @@ static ssize_t ad5940_read_info(struct iio_dev *indio_dev,
 	}
 }
 
-static const struct iio_chan_spec_ext_info ad4590_ext_info[] = {
+static const struct iio_chan_spec_ext_info ad5940_ext_info[] = {
 	{
 		.name = "name",
 		.read = ad5940_read_info,
 		.private = AD5940_CHANNEL_NAME,
 		.shared = IIO_SEPARATE,
 	},
-	{ },
+	{ }
 };
 
 static const struct iio_chan_spec ad5940_channel_template = {
 	.type = IIO_VOLTAGE,
 	.differential = 1,
 	.indexed = 1,
-	.ext_info = ad4590_ext_info,
+	.ext_info = ad5940_ext_info,
 	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
-	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),
+	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |
+				    BIT(IIO_CHAN_INFO_OFFSET),
 };
 
 static int ad5940_clear_ready(struct ad5940_state *st)
@@ -268,7 +280,7 @@ static irqreturn_t ad5940_irq_handler(int irq, void *private)
 
 	ret = ad5940_clear_ready(st);
 	if (ret < 0)
-		return ret;
+		return IRQ_NONE;
 
 	complete(&st->complete);
 
@@ -277,45 +289,41 @@ static irqreturn_t ad5940_irq_handler(int irq, void *private)
 
 static int ad5940_scan_direct(struct ad5940_state *st, u32 mux, int *val)
 {
-	int ret;
 	u32 result;
+	int ret;
 
-	mutex_lock(&st->lock);
+	guard(mutex)(&st->lock);
+
 	ret = ad5940_write_reg_mask(st, AD5940_REG_ADCCON,
 				    AD5940_ADCCON_MUX_MSK, mux);
 	if (ret < 0)
-		goto unlock_return;
+		return ret;
 
 	reinit_completion(&st->complete);
 	ret = ad5940_write_reg_mask(st, AD5940_REG_AFECON,
 				    AD5940_AFECON_ADCCONV_MSK,
 				    AD5940_AFECON_ADCCONV_EN);
 	if (ret < 0)
-		goto unlock_return;
+		return ret;
 
-	ret = wait_for_completion_timeout(&st->complete,
-					  msecs_to_jiffies(1000));
-	if (!ret) {
+	if (!wait_for_completion_timeout(&st->complete,
+					 msecs_to_jiffies(1000))) {
 		ad5940_clear_ready(st);
-		ret = -ETIMEDOUT;
-		goto unlock_return;
+		return -ETIMEDOUT;
 	}
 
 	ret = ad5940_read_reg(st, AD5940_REG_ADCDAT, &result);
-	mutex_unlock(&st->lock);
 	if (ret < 0)
 		return ret;
+
 	*val = result & 0xffff;
 
 	return 0;
-
-unlock_return:
-	mutex_unlock(&st->lock);
-	return ret;
 }
 
 static int ad5940_read_raw(struct iio_dev *indio_dev,
-	const struct iio_chan_spec *chan, int *val, int *val2, long info)
+			   const struct iio_chan_spec *chan, int *val,
+			   int *val2, long info)
 {
 	struct ad5940_state *st = iio_priv(indio_dev);
 	int ret;
@@ -323,15 +331,19 @@ static int ad5940_read_raw(struct iio_dev *indio_dev,
 	switch (info) {
 	case IIO_CHAN_INFO_RAW:
 		ret = ad5940_scan_direct(st,
-				st->channel_config[chan->address].ain,
-				val);
+					 st->channel_config[chan->address].ain,
+					 val);
 		if (ret < 0)
 			return ret;
-		else
-			return IIO_VAL_INT;
+
+		return IIO_VAL_INT;
+	case IIO_CHAN_INFO_OFFSET:
+		/* Codes are offset binary, 0 V is mid-scale. */
+		*val = -AD5940_ADC_MIDSCALE;
+		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
 		*val = st->vref_mv;
-		*val2 = 16;
+		*val2 = 15;
 		return IIO_VAL_FRACTIONAL_LOG2;
 	default:
 		return -EINVAL;
@@ -342,61 +354,60 @@ static const struct iio_info ad5940_info = {
 	.read_raw = &ad5940_read_raw,
 };
 
-int cmp_u8(const void *a, const void *b)
+static const u8 ad5940_channel_p[] = {
+	0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 19,
+	20, 22, 23, 24, 25, 26, 31, 33, 35, 36
+};
+
+static const u8 ad5940_channel_n[] = {
+	0, 1, 2, 4, 5, 6, 7, 10, 11, 12, 14, 16, 17, 20
+};
+
+static const u8 ad5940_int_io[] = { 0, 3, 6 };
+
+static bool ad5940_in_list(const u8 *list, size_t len, u32 val)
 {
-	return (*(u8 *)a - *(u8 *)b);
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		if (list[i] == val)
+			return true;
+
+	return false;
 }
 
 static int ad5940_check_channel_indexes(struct device *dev, u32 *ain)
 {
-	const u8 channel_p[] = {
-		0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 19,
-		20, 22, 23, 24, 25, 26, 31, 33, 35, 36
-	};
-	const u8 channel_n[] = {
-		0, 1, 2, 4, 5, 6, 7, 10, 11, 12, 14, 16, 17, 20
-	};
-	u8 *index;
+	if (!ad5940_in_list(ad5940_channel_p, ARRAY_SIZE(ad5940_channel_p),
+			    ain[0]))
+		return dev_err_probe(dev, -EINVAL,
+				     "Invalid positive input %u\n", ain[0]);
 
-	index = (u8 *) bsearch(&ain[0], channel_p, ARRAY_SIZE(channel_p),
-				sizeof(u8), cmp_u8);
-	if (!index) {
-		dev_err(dev, "Positive input index not found.\n");
-		return -EINVAL;
-	}
-
-	index = (u8 *) bsearch(&ain[1], channel_n, ARRAY_SIZE(channel_n),
-				sizeof(u8), cmp_u8);
-	if (!index) {
-		dev_err(dev, "negtive input index not found.\n");
-		return -EINVAL;
-	}
+	if (!ad5940_in_list(ad5940_channel_n, ARRAY_SIZE(ad5940_channel_n),
+			    ain[1]))
+		return dev_err_probe(dev, -EINVAL,
+				     "Invalid negative input %u\n", ain[1]);
 
 	return 0;
 }
 
-static int ad5940_of_parse_channel_config(struct iio_dev *indio_dev,
-					  struct device_node *np)
+static int ad5940_parse_channel_config(struct iio_dev *indio_dev)
 {
 	struct ad5940_state *st = iio_priv(indio_dev);
+	struct device *dev = indio_dev->dev.parent;
 	struct iio_chan_spec *chan;
-	struct device_node *child;
 	u32 channel, ain[2];
 	int ret;
 
-	st->num_channels = of_get_available_child_count(np);
-	if (!st->num_channels) {
-		dev_err(indio_dev->dev.parent, "no channel children\n");
-		return -ENODEV;
-	}
+	st->num_channels = device_get_child_node_count(dev);
+	if (!st->num_channels)
+		return dev_err_probe(dev, -ENODEV, "no channel children\n");
 
-	chan = devm_kcalloc(indio_dev->dev.parent, st->num_channels,
-			    sizeof(*chan), GFP_KERNEL);
+	chan = devm_kcalloc(dev, st->num_channels, sizeof(*chan), GFP_KERNEL);
 	if (!chan)
 		return -ENOMEM;
 
-	st->channel_config = devm_kcalloc(indio_dev->dev.parent,
-					  st->num_channels,
+	st->channel_config = devm_kcalloc(dev, st->num_channels,
 					  sizeof(*st->channel_config),
 					  GFP_KERNEL);
 	if (!st->channel_config)
@@ -405,28 +416,31 @@ static int ad5940_of_parse_channel_config(struct iio_dev *indio_dev,
 	indio_dev->channels = chan;
 	indio_dev->num_channels = st->num_channels;
 
-	for_each_available_child_of_node(np, child) {
-		ret = of_property_read_u32(child, "reg", &channel);
+	device_for_each_child_node_scoped(dev, child) {
+		ret = fwnode_property_read_u32(child, "reg", &channel);
 		if (ret)
-			goto err;
+			return dev_err_probe(dev, ret,
+					     "Missing channel reg property\n");
 
-		ret = of_property_read_u32_array(child, "diff-channels",
-						 ain, 2);
+		if (channel >= st->num_channels)
+			return dev_err_probe(dev, -EINVAL,
+					     "Invalid channel index %u\n",
+					     channel);
+
+		ret = fwnode_property_read_u32_array(child, "diff-channels",
+						     ain, 2);
 		if (ret)
-			goto err;
+			return dev_err_probe(dev, ret,
+					     "Missing diff-channels property\n");
 
-		ret = of_property_read_string(child, "channel-name",
-				&st->channel_config[channel].channel_name);
+		ret = fwnode_property_read_string(child, "channel-name",
+						  &st->channel_config[channel].channel_name);
 		if (ret)
 			st->channel_config[channel].channel_name = "none-name";
 
-		ret = ad5940_check_channel_indexes(indio_dev->dev.parent, ain);
-		if (ret) {
-			dev_err(indio_dev->dev.parent,
-				"some input channel index does not exist: %d, %d, %d",
-				channel, ain[0], ain[1]);
-			goto err;
-		}
+		ret = ad5940_check_channel_indexes(dev, ain);
+		if (ret)
+			return ret;
 
 		st->channel_config[channel].ain = AD5940_CHANNEL_AINP(ain[0]) |
 						  AD5940_CHANNEL_AINN(ain[1]);
@@ -441,10 +455,6 @@ static int ad5940_of_parse_channel_config(struct iio_dev *indio_dev,
 	}
 
 	return 0;
-err:
-	of_node_put(child);
-
-	return ret;
 }
 
 static int ad5940_config_polarity(struct ad5940_state *st, u32 polarity)
@@ -495,8 +505,9 @@ static const u32 ad5940_powerup_setting[][2] = {
 	{ 0x2230, 0xde87a5a0 },
 };
 
-static int ad5940_setup(struct ad5940_state *st, u8 int_io)
+static int ad5940_setup(struct ad5940_state *st, u8 int_io, u32 trig_type)
 {
+	struct device *dev = &st->spi->dev;
 	u32 chip_id;
 	int ret;
 	u8 i;
@@ -511,11 +522,13 @@ static int ad5940_setup(struct ad5940_state *st, u8 int_io)
 	ret = ad5940_read_reg(st, AD5940_AFECON_CHIPID, &chip_id);
 	if (ret < 0)
 		return ret;
-	if (chip_id != AD5940_CHIPID) {
-		dev_err(&st->spi->dev, "Wrong chip ID with 0x%x.", chip_id);
-		return -ENXIO;
-	}
-	dev_info(&st->spi->dev, "Found ad5940");
+	if (chip_id != AD5940_CHIPID)
+		return dev_err_probe(dev, -ENXIO,
+				     "Wrong chip ID 0x%x\n", chip_id);
+
+	ret = ad5940_config_polarity(st, trig_type);
+	if (ret < 0)
+		return ret;
 
 	ret = ad5940_write_reg(st, AD5940_REG_PMBW,
 			       AD5940_PMBW_LP | AD5940_PMBW_BW250);
@@ -545,135 +558,94 @@ static int ad5940_setup(struct ad5940_state *st, u8 int_io)
 				     AD5940_AFECON_ADCEN);
 }
 
-static void ad5940_regulator_disable(void *data)
-{
-	struct ad5940_state *st = data;
-
-	regulator_disable(st->vref);
-}
-
-static inline int ad5940_check_int_io(u32 io, struct device *dev)
-{
-	static const u8 int_io[3] = {0, 3, 6};
-	u8 *p;
-
-	p = bsearch(&io, int_io, 3, sizeof(u8), cmp_u8);
-	if (!p) {
-		dev_err(dev, "interrupt output pin not valid,");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
 static int ad5940_probe(struct spi_device *spi)
 {
+	struct device *dev = &spi->dev;
 	struct iio_dev *indio_dev;
 	struct ad5940_state *st;
 	u32 trig_type;
-	int vref_uv = 0;
 	u32 int_io;
+	int vref_uv;
 	int ret;
 
-	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*st));
+	indio_dev = devm_iio_device_alloc(dev, sizeof(*st));
 	if (!indio_dev)
 		return -ENOMEM;
 
 	st = iio_priv(indio_dev);
 
-	ret = device_property_read_u32(&spi->dev, "adi,interrupt-io", &int_io);
-	if (ret) {
-		dev_err(&spi->dev,
-			"reading dt property 'adi,interrupt-io' failed.");
-		return -EINVAL;
-	}
+	ret = device_property_read_u32(dev, "adi,interrupt-io", &int_io);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "Failed to read adi,interrupt-io\n");
+
+	if (!ad5940_in_list(ad5940_int_io, ARRAY_SIZE(ad5940_int_io), int_io))
+		return dev_err_probe(dev, -EINVAL,
+				     "Invalid interrupt output pin %u\n",
+				     int_io);
 
 	st->spi = spi;
+	mutex_init(&st->lock);
+	init_completion(&st->complete);
 
 	trig_type = irq_get_trigger_type(spi->irq);
 	if (trig_type != IRQF_TRIGGER_RISING &&
-	    trig_type != IRQF_TRIGGER_FALLING) {
-		dev_err(&spi->dev, "trigger type must be rising or falling.");
-		return -EINVAL;
-	}
-	ret = ad5940_config_polarity(st, trig_type);
-	if (ret < 0) {
-		dev_err(&spi->dev, "config polarity failed.");
-		return ret;
-	}
+	    trig_type != IRQF_TRIGGER_FALLING)
+		return dev_err_probe(dev, -EINVAL,
+				     "Trigger type must be rising or falling\n");
 
-	ret = ad5940_check_int_io(int_io, &spi->dev);
-	if (ret < 0)
-		return ret;
-
-	st->vref = devm_regulator_get_optional(&spi->dev, "vref");
-	if (!IS_ERR(st->vref)) {
-		ret = regulator_enable(st->vref);
-		if (ret) {
-			dev_err(&spi->dev, "Failed to enbale specified vref supply.\n");
-			return ret;
-		}
-
-		ret = devm_add_action_or_reset(&spi->dev,
-				ad5940_regulator_disable, st);
-		if (ret) {
-			regulator_disable(st->vref);
-			return ret;
-		}
-
-		ret = regulator_get_voltage(st->vref);
-		if (ret < 0)
-			return ret;
-
-		vref_uv = ret;
-	}
-
-	if (vref_uv)
+	vref_uv = devm_regulator_get_enable_read_voltage(dev, "vref");
+	if (vref_uv >= 0)
 		st->vref_mv = vref_uv / 1000;
+	else if (vref_uv == -ENODEV)
+		st->vref_mv = AD5940_DEFAULT_VREF_MV;
 	else
-		st->vref_mv = 1820;
+		return dev_err_probe(dev, vref_uv, "Failed to get vref\n");
 
-	indio_dev->dev.parent = &spi->dev;
-	indio_dev->dev.of_node = spi->dev.of_node;
-	indio_dev->name = spi->dev.of_node->name;
+	indio_dev->name = "ad5940";
 	indio_dev->modes = INDIO_DIRECT_MODE;
 	indio_dev->info = &ad5940_info;
 
-	ret = ad5940_of_parse_channel_config(indio_dev, spi->dev.of_node);
+	ret = ad5940_parse_channel_config(indio_dev);
 	if (ret < 0)
 		return ret;
 
-	init_completion(&st->complete);
-
-	ret = ad5940_setup(st, int_io);
+	ret = ad5940_setup(st, int_io, trig_type);
 	if (ret)
 		return ret;
 
-	ret = devm_request_threaded_irq(&spi->dev, spi->irq, NULL,
+	ret = devm_request_threaded_irq(dev, spi->irq, NULL,
 					ad5940_irq_handler,
 					trig_type | IRQF_ONESHOT,
-					dev_name(&spi->dev), st);
+					dev_name(dev), st);
 	if (ret < 0)
-		return ret;
+		return dev_err_probe(dev, ret, "Failed to request IRQ\n");
 
-	return devm_iio_device_register(&spi->dev, indio_dev);
+	return devm_iio_device_register(dev, indio_dev);
 }
 
-static const struct of_device_id ad5940_dt_match[] = {
+static const struct of_device_id ad5940_of_match[] = {
 	{ .compatible = "adi,ad5940" },
-	{},
+	{ }
 };
-MODULE_DEVICE_TABLE(of, ad5940_spi_ids);
+MODULE_DEVICE_TABLE(of, ad5940_of_match);
+
+static const struct spi_device_id ad5940_id[] = {
+	{ "ad5940" },
+	{ }
+};
+MODULE_DEVICE_TABLE(spi, ad5940_id);
 
 static struct spi_driver ad5940_driver = {
 	.driver = {
 		.name = "ad5940",
-		.of_match_table = ad5940_dt_match,
+		.of_match_table = ad5940_of_match,
 	},
 	.probe = ad5940_probe,
+	.id_table = ad5940_id,
 };
 module_spi_driver(ad5940_driver);
 
 MODULE_AUTHOR("Song Qiang <songqiang1304521@gmail.com>");
-MODULE_DESCRIPTION("Analog Device AD5940 ADC driver");
+MODULE_DESCRIPTION("Analog Devices AD5940 ADC driver");
 MODULE_LICENSE("GPL");
