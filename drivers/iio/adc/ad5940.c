@@ -10,8 +10,10 @@
 #include <linux/bits.h>
 #include <linux/cleanup.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
+#include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/jiffies.h>
@@ -20,10 +22,12 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/property.h>
+#include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 
 #include <linux/iio/iio.h>
 
@@ -115,9 +119,18 @@
 #define AD5940_REG_GP0OEN		0x00000004
 
 #define AD5940_AFECON_CHIPID		0x00000404
-#define AD5940_CHIPID			0x5502
+#define AD5940_CHIPID_PARTID_MSK	GENMASK(15, 4)
+#define AD5940_PARTID			0x550
 #define AD5940_DEFAULT_VREF_MV		1820
 #define AD5940_ADC_MIDSCALE		32768
+
+/* Registers in this range are 32 bits wide, all others are 16 bits wide. */
+#define AD5940_REG32_MIN		0x1000
+#define AD5940_REG32_MAX		0x3014
+#define AD5940_MAX_REGISTER		0xffff
+
+#define AD5940_RESET_PULSE_US		1000
+#define AD5940_RESET_WAIT_MS		10
 
 struct ad5940_channel_config {
 	u32 ain;
@@ -126,7 +139,9 @@ struct ad5940_channel_config {
 
 struct ad5940_state {
 	struct spi_device *spi;
-	/* This mutex is for protecting the SPI command sequences. */
+	struct regmap *regmap;
+	struct gpio_desc *reset_gpio;
+	/* This mutex is for protecting the ADC conversion sequence. */
 	struct mutex lock;
 
 	struct completion complete;
@@ -139,89 +154,122 @@ struct ad5940_state {
 
 	int num_channels;
 	struct ad5940_channel_config *channel_config;
-	union {
-		__be32 d32;
-		u8 d8[5];
-	} data __aligned(IIO_DMA_MINALIGN);
 };
 
-static int ad5940_set_addr(struct ad5940_state *st, u16 addr)
-{
-	st->data.d8[0] = AD5940_SPICMD_SETADDR;
-	st->data.d8[1] = (addr >> 8) & 0xff;
-	st->data.d8[2] = addr & 0xff;
+/*
+ * The AD5940 SPI protocol needs a first transfer to set the register address
+ * and a second one, with chip select toggled in between, to access it.
+ */
+struct ad5940_bus {
+	struct spi_device *spi;
+	/* DMA safe buffers, accesses are serialized by the regmap lock. */
+	u8 setaddr[3] __aligned(IIO_DMA_MINALIGN);
+	u8 wr[5];
+	u8 rd_cmd[2];
+	u8 rd[4];
+};
 
-	return spi_write(st->spi, st->data.d8, 3);
+static bool ad5940_reg_is_32bit(unsigned int reg)
+{
+	return reg >= AD5940_REG32_MIN && reg <= AD5940_REG32_MAX;
 }
 
-static int ad5940_read_reg(struct ad5940_state *st, u16 addr, u32 *data)
+static void ad5940_bus_set_addr(struct ad5940_bus *bus,
+				struct spi_transfer *xfer, unsigned int reg)
 {
-	int rx_len;
-	u8 shift;
+	bus->setaddr[0] = AD5940_SPICMD_SETADDR;
+	put_unaligned_be16(reg, &bus->setaddr[1]);
+
+	xfer->tx_buf = bus->setaddr;
+	xfer->len = sizeof(bus->setaddr);
+	xfer->cs_change = 1;
+	xfer->cs_change_delay.value = 1;
+	xfer->cs_change_delay.unit = SPI_DELAY_UNIT_USECS;
+}
+
+static int ad5940_bus_write(void *context, const void *data, size_t count)
+{
+	struct ad5940_bus *bus = context;
+	struct spi_transfer xfers[2] = { };
+	unsigned int reg, len;
+
+	/* data is a big-endian 16-bit address followed by a 32-bit value. */
+	if (count != 6)
+		return -EINVAL;
+
+	reg = get_unaligned_be16(data);
+	ad5940_bus_set_addr(bus, &xfers[0], reg);
+
+	/* 16-bit registers only use the two least significant value bytes. */
+	len = ad5940_reg_is_32bit(reg) ? 4 : 2;
+	bus->wr[0] = AD5940_SPICMD_WRITEREG;
+	memcpy(&bus->wr[1], data + 2 + (4 - len), len);
+
+	xfers[1].tx_buf = bus->wr;
+	xfers[1].len = 1 + len;
+
+	return spi_sync_transfer(bus->spi, xfers, ARRAY_SIZE(xfers));
+}
+
+static int ad5940_bus_read(void *context, const void *reg_buf, size_t reg_size,
+			   void *val_buf, size_t val_size)
+{
+	struct ad5940_bus *bus = context;
+	struct spi_transfer xfers[3] = { };
+	unsigned int reg, len;
 	int ret;
 
-	ret = ad5940_set_addr(st, addr);
-	if (ret < 0)
+	if (reg_size != 2 || val_size != 4)
+		return -EINVAL;
+
+	reg = get_unaligned_be16(reg_buf);
+	ad5940_bus_set_addr(bus, &xfers[0], reg);
+
+	len = ad5940_reg_is_32bit(reg) ? 4 : 2;
+	/* The command is followed by one dummy byte before data is returned. */
+	bus->rd_cmd[0] = AD5940_SPICMD_READREG;
+	bus->rd_cmd[1] = 0;
+
+	xfers[1].tx_buf = bus->rd_cmd;
+	xfers[1].len = sizeof(bus->rd_cmd);
+	xfers[2].rx_buf = bus->rd;
+	xfers[2].len = len;
+
+	ret = spi_sync_transfer(bus->spi, xfers, ARRAY_SIZE(xfers));
+	if (ret)
 		return ret;
 
-	if ((addr >= 0x1000) && (addr <= 0x3014))
-		rx_len = 4;
-	else
-		rx_len = 2;
-
-	st->data.d8[0] = AD5940_SPICMD_READREG;
-	st->data.d8[1] = 0;
-	shift = 32 - (8 * rx_len);
-
-	ret = spi_write_then_read(st->spi, st->data.d8, 2, &st->data.d32,
-				  rx_len);
-	if (ret < 0)
-		return ret;
-
-	*data = be32_to_cpu(st->data.d32) >> shift;
+	memset(val_buf, 0, val_size);
+	memcpy(val_buf + (val_size - len), bus->rd, len);
 
 	return 0;
 }
 
-static int ad5940_write_reg(struct ad5940_state *st, u16 addr, u32 data)
+static const struct regmap_bus ad5940_regmap_bus = {
+	.write = ad5940_bus_write,
+	.read = ad5940_bus_read,
+	.reg_format_endian_default = REGMAP_ENDIAN_BIG,
+	.val_format_endian_default = REGMAP_ENDIAN_BIG,
+};
+
+static const struct regmap_config ad5940_regmap_config = {
+	.reg_bits = 16,
+	.val_bits = 32,
+	.max_register = AD5940_MAX_REGISTER,
+	.use_single_read = true,
+	.use_single_write = true,
+	.cache_type = REGCACHE_NONE,
+};
+
+static int ad5940_reg_access(struct iio_dev *indio_dev, unsigned int reg,
+			     unsigned int writeval, unsigned int *readval)
 {
-	int tx_len;
-	int ret;
+	struct ad5940_state *st = iio_priv(indio_dev);
 
-	ret = ad5940_set_addr(st, addr);
-	if (ret < 0)
-		return ret;
+	if (readval)
+		return regmap_read(st->regmap, reg, readval);
 
-	st->data.d8[0] = AD5940_SPICMD_WRITEREG;
-	if ((addr >= 0x1000) && (addr <= 0x3014)) {
-		st->data.d8[1] = (data >> 24) & 0xff;
-		st->data.d8[2] = (data >> 16) & 0xff;
-		st->data.d8[3] = (data >> 8) & 0xff;
-		st->data.d8[4] = data & 0xff;
-		tx_len = 5;
-	} else {
-		st->data.d8[1] = (data >> 8) & 0xff;
-		st->data.d8[2] = data & 0xff;
-		tx_len = 3;
-	}
-
-	return spi_write(st->spi, st->data.d8, tx_len);
-}
-
-static int ad5940_write_reg_mask(struct ad5940_state *st, u16 addr,
-				 u32 mask, u32 data)
-{
-	u32 temp;
-	int ret;
-
-	ret = ad5940_read_reg(st, addr, &temp);
-	if (ret < 0)
-		return ret;
-
-	temp &= ~mask;
-	temp |= data;
-
-	return ad5940_write_reg(st, addr, temp);
+	return regmap_write(st->regmap, reg, writeval);
 }
 
 static ssize_t ad5940_read_info(struct iio_dev *indio_dev,
@@ -264,13 +312,13 @@ static int ad5940_clear_ready(struct ad5940_state *st)
 {
 	int ret;
 
-	ret = ad5940_write_reg_mask(st, AD5940_REG_AFECON,
-				    AD5940_AFECON_ADCCONV_MSK,
-				    AD5940_AFECON_ADCCONV_DIS);
+	ret = regmap_update_bits(st->regmap, AD5940_REG_AFECON,
+				 AD5940_AFECON_ADCCONV_MSK,
+				 AD5940_AFECON_ADCCONV_DIS);
 	if (ret < 0)
 		return ret;
 
-	return ad5940_write_reg(st, AD5940_REG_INTCLR, AD5940_INTC_ADC);
+	return regmap_write(st->regmap, AD5940_REG_INTCLR, AD5940_INTC_ADC);
 }
 
 static irqreturn_t ad5940_irq_handler(int irq, void *private)
@@ -289,20 +337,20 @@ static irqreturn_t ad5940_irq_handler(int irq, void *private)
 
 static int ad5940_scan_direct(struct ad5940_state *st, u32 mux, int *val)
 {
-	u32 result;
+	unsigned int result;
 	int ret;
 
 	guard(mutex)(&st->lock);
 
-	ret = ad5940_write_reg_mask(st, AD5940_REG_ADCCON,
-				    AD5940_ADCCON_MUX_MSK, mux);
+	ret = regmap_update_bits(st->regmap, AD5940_REG_ADCCON,
+				 AD5940_ADCCON_MUX_MSK, mux);
 	if (ret < 0)
 		return ret;
 
 	reinit_completion(&st->complete);
-	ret = ad5940_write_reg_mask(st, AD5940_REG_AFECON,
-				    AD5940_AFECON_ADCCONV_MSK,
-				    AD5940_AFECON_ADCCONV_EN);
+	ret = regmap_update_bits(st->regmap, AD5940_REG_AFECON,
+				 AD5940_AFECON_ADCCONV_MSK,
+				 AD5940_AFECON_ADCCONV_EN);
 	if (ret < 0)
 		return ret;
 
@@ -312,7 +360,7 @@ static int ad5940_scan_direct(struct ad5940_state *st, u32 mux, int *val)
 		return -ETIMEDOUT;
 	}
 
-	ret = ad5940_read_reg(st, AD5940_REG_ADCDAT, &result);
+	ret = regmap_read(st->regmap, AD5940_REG_ADCDAT, &result);
 	if (ret < 0)
 		return ret;
 
@@ -352,6 +400,7 @@ static int ad5940_read_raw(struct iio_dev *indio_dev,
 
 static const struct iio_info ad5940_info = {
 	.read_raw = &ad5940_read_raw,
+	.debugfs_reg_access = &ad5940_reg_access,
 };
 
 static const u8 ad5940_channel_p[] = {
@@ -466,8 +515,8 @@ static int ad5940_config_polarity(struct ad5940_state *st, u32 polarity)
 	else
 		val = AD5940_INTCPOL_NEG;
 
-	return ad5940_write_reg_mask(st, AD5940_REG_INTCPOL,
-				     AD5940_INTCPOL_MSK, val);
+	return regmap_update_bits(st->regmap, AD5940_REG_INTCPOL,
+				  AD5940_INTCPOL_MSK, val);
 }
 
 static int ad5940_config_int_io(struct ad5940_state *st, u8 int_io)
@@ -475,17 +524,17 @@ static int ad5940_config_int_io(struct ad5940_state *st, u8 int_io)
 	int ret = 0;
 
 	if (int_io == 3)
-		ret = ad5940_write_reg_mask(st, AD5940_REG_GP0CON,
-					    AD5940_GP0CON_3_MSK,
-					    AD5940_GP0CON_3_INT);
+		ret = regmap_update_bits(st->regmap, AD5940_REG_GP0CON,
+					 AD5940_GP0CON_3_MSK,
+					 AD5940_GP0CON_3_INT);
 	else if (int_io == 6)
-		ret = ad5940_write_reg_mask(st, AD5940_REG_GP0CON,
-					    AD5940_GP0CON_6_MSK,
-					    AD5940_GP0CON_6_INT);
+		ret = regmap_update_bits(st->regmap, AD5940_REG_GP0CON,
+					 AD5940_GP0CON_6_MSK,
+					 AD5940_GP0CON_6_INT);
 	if (ret < 0)
 		return ret;
 
-	return  ad5940_write_reg(st, AD5940_REG_GP0OEN, BIT(int_io));
+	return regmap_write(st->regmap, AD5940_REG_GP0OEN, BIT(int_io));
 }
 
 static const u32 ad5940_powerup_setting[][2] = {
@@ -505,24 +554,44 @@ static const u32 ad5940_powerup_setting[][2] = {
 	{ 0x2230, 0xde87a5a0 },
 };
 
+static void ad5940_hw_reset(struct ad5940_state *st)
+{
+	if (!st->reset_gpio)
+		return;
+
+	gpiod_set_value_cansleep(st->reset_gpio, 1);
+	fsleep(AD5940_RESET_PULSE_US);
+	gpiod_set_value_cansleep(st->reset_gpio, 0);
+	msleep(AD5940_RESET_WAIT_MS);
+}
+
 static int ad5940_setup(struct ad5940_state *st, u8 int_io, u32 trig_type)
 {
 	struct device *dev = &st->spi->dev;
-	u32 chip_id;
+	unsigned int chip_id;
 	int ret;
 	u8 i;
 
+	ad5940_hw_reset(st);
+
+	/*
+	 * The AFE may be hibernating and wakes up on bus activity, so the
+	 * result of the first register access is discarded.
+	 */
+	regmap_read(st->regmap, AD5940_AFECON_CHIPID, &chip_id);
+
 	for (i = 0; i < ARRAY_SIZE(ad5940_powerup_setting); i++) {
-		ret = ad5940_write_reg(st, ad5940_powerup_setting[i][0],
-				       ad5940_powerup_setting[i][1]);
+		ret = regmap_write(st->regmap, ad5940_powerup_setting[i][0],
+				   ad5940_powerup_setting[i][1]);
 		if (ret < 0)
 			return ret;
 	}
 
-	ret = ad5940_read_reg(st, AD5940_AFECON_CHIPID, &chip_id);
+	ret = regmap_read(st->regmap, AD5940_AFECON_CHIPID, &chip_id);
 	if (ret < 0)
 		return ret;
-	if (chip_id != AD5940_CHIPID)
+	/* The silicon revision may differ, only check the part ID. */
+	if (FIELD_GET(AD5940_CHIPID_PARTID_MSK, chip_id) != AD5940_PARTID)
 		return dev_err_probe(dev, -ENXIO,
 				     "Wrong chip ID 0x%x\n", chip_id);
 
@@ -530,8 +599,8 @@ static int ad5940_setup(struct ad5940_state *st, u8 int_io, u32 trig_type)
 	if (ret < 0)
 		return ret;
 
-	ret = ad5940_write_reg(st, AD5940_REG_PMBW,
-			       AD5940_PMBW_LP | AD5940_PMBW_BW250);
+	ret = regmap_write(st->regmap, AD5940_REG_PMBW,
+			   AD5940_PMBW_LP | AD5940_PMBW_BW250);
 	if (ret < 0)
 		return ret;
 
@@ -543,19 +612,17 @@ static int ad5940_setup(struct ad5940_state *st, u8 int_io, u32 trig_type)
 	if (ret < 0)
 		return ret;
 
-	ret = ad5940_write_reg(st, AD5940_REG_INTCSEL0, AD5940_INTC_ADC);
+	ret = regmap_write(st->regmap, AD5940_REG_INTCSEL0, AD5940_INTC_ADC);
 	if (ret < 0)
 		return ret;
 
-	ret = ad5940_write_reg_mask(st, AD5940_REG_ADCCON,
-				    AD5940_ADCCON_PGA_MSK,
-				    AD5940_ADCCON_PGA_1);
+	ret = regmap_update_bits(st->regmap, AD5940_REG_ADCCON,
+				 AD5940_ADCCON_PGA_MSK, AD5940_ADCCON_PGA_1);
 	if (ret < 0)
 		return ret;
 
-	return ad5940_write_reg_mask(st, AD5940_REG_AFECON,
-				     AD5940_AFECON_ADCEN_MSK,
-				     AD5940_AFECON_ADCEN);
+	return regmap_update_bits(st->regmap, AD5940_REG_AFECON,
+				  AD5940_AFECON_ADCEN_MSK, AD5940_AFECON_ADCEN);
 }
 
 static int ad5940_probe(struct spi_device *spi)
@@ -563,6 +630,7 @@ static int ad5940_probe(struct spi_device *spi)
 	struct device *dev = &spi->dev;
 	struct iio_dev *indio_dev;
 	struct ad5940_state *st;
+	struct ad5940_bus *bus;
 	u32 trig_type;
 	u32 int_io;
 	int vref_uv;
@@ -587,6 +655,23 @@ static int ad5940_probe(struct spi_device *spi)
 	st->spi = spi;
 	mutex_init(&st->lock);
 	init_completion(&st->complete);
+
+	bus = devm_kzalloc(dev, sizeof(*bus), GFP_KERNEL);
+	if (!bus)
+		return -ENOMEM;
+
+	bus->spi = spi;
+
+	st->regmap = devm_regmap_init(dev, &ad5940_regmap_bus, bus,
+				      &ad5940_regmap_config);
+	if (IS_ERR(st->regmap))
+		return dev_err_probe(dev, PTR_ERR(st->regmap),
+				     "Failed to initialize regmap\n");
+
+	st->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(st->reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(st->reset_gpio),
+				     "Failed to get reset GPIO\n");
 
 	trig_type = irq_get_trigger_type(spi->irq);
 	if (trig_type != IRQF_TRIGGER_RISING &&

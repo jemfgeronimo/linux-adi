@@ -171,6 +171,7 @@ config AD4695
 config AD5940
 	tristate "Analog Devices AD5940 ADC Driver"
 	depends on SPI
+	select REGMAP
 	help
 	  Say yes here to build support for the ADC part of Analog Devices
 	  analog front end AD5940.
